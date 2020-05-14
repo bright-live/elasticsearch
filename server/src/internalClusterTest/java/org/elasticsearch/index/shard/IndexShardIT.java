@@ -61,6 +61,7 @@ import org.elasticsearch.index.IndexSettings;
 import org.elasticsearch.index.VersionType;
 import org.elasticsearch.index.engine.CommitStats;
 import org.elasticsearch.index.engine.Engine;
+import org.elasticsearch.index.engine.EngineTestCase;
 import org.elasticsearch.index.engine.NoOpEngine;
 import org.elasticsearch.index.engine.SegmentsStats;
 import org.elasticsearch.index.flush.FlushStats;
@@ -97,10 +98,13 @@ import java.util.Locale;
 import java.util.concurrent.BrokenBarrierException;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.Phaser;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Consumer;
 import java.util.function.Predicate;
+import java.util.function.ToLongFunction;
 import java.util.stream.Stream;
 
 import static com.carrotsearch.randomizedtesting.RandomizedTest.randomAsciiLettersOfLength;
@@ -111,6 +115,7 @@ import static org.elasticsearch.action.support.WriteRequest.RefreshPolicy.NONE;
 import static org.elasticsearch.cluster.metadata.IndexMetadata.SETTING_NUMBER_OF_REPLICAS;
 import static org.elasticsearch.cluster.metadata.IndexMetadata.SETTING_NUMBER_OF_SHARDS;
 import static org.elasticsearch.cluster.routing.TestShardRouting.newShardRouting;
+import static org.elasticsearch.index.shard.IndexShardTestCase.getEngine;
 import static org.elasticsearch.index.shard.IndexShardTestCase.getTranslog;
 import static org.elasticsearch.index.shard.IndexShardTestCase.recoverFromStore;
 import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.assertAcked;
@@ -757,6 +762,49 @@ public class IndexShardIT extends ESSingleNodeTestCase {
         for (IndexShard indexShard : indexService) {
             assertThat(indexShard.getEngine(), instanceOf(NoOpEngine.class));
         }
+    }
+
+    public void testPruneUidLookupCache() throws Exception {
+        ToLongFunction<IndexService> uidLookupCache = indexService -> {
+            long total = 0;
+            for (IndexShard shard : indexService) {
+                total += EngineTestCase.getUidLookupCacheSize(getEngine(shard));
+            }
+            return total;
+        };
+        Consumer<String> indexer = (indexName) -> {
+            Thread[] threads = new Thread[between(1, 4)];
+            Phaser phaser = new Phaser(threads.length);
+            for (int t = 0; t < threads.length; t++) {
+                threads[t] = new Thread(() -> {
+                    phaser.arriveAndAwaitAdvance();
+                    int numDocs = between(1, 10);
+                    for (int i = 0; i < numDocs; i++) {
+                        client().prepareIndex(indexName).setId(Integer.toString(randomInt(10))).setSource("{}", XContentType.JSON).get();
+                    }
+                });
+                threads[t].start();
+            }
+            for (Thread thread : threads) {
+                try {
+                    thread.join();
+                } catch (InterruptedException e) {
+                    throw new AssertionError(e);
+                }
+            }
+        };
+        IndexService indexService = createIndex("index-1", Settings.EMPTY);
+        ensureGreen();
+        assertThat(uidLookupCache.applyAsLong(indexService), equalTo(0L));
+        indexer.accept("index-1");
+        assertThat(uidLookupCache.applyAsLong(indexService), greaterThan(0L));
+        client().admin().indices().prepareRefresh().get();
+        assertThat(uidLookupCache.applyAsLong(indexService), equalTo(0L));
+        IndexService quickPruneIndexService = createIndex("index-2", Settings.builder()
+            .put(InternalSettingsPlugin.PRUNE_UI_LOOKUP_CACHE_INTERVAL_SETTING.getKey(), TimeValue.timeValueMillis(between(100, 200)))
+            .build());
+        indexer.accept("index-2");
+        assertBusy(() -> assertThat(uidLookupCache.applyAsLong(quickPruneIndexService), equalTo(0L)));
     }
 
     /**

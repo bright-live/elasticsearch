@@ -23,71 +23,60 @@ import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.index.LeafReader;
 import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.index.Term;
-import org.apache.lucene.util.CloseableThreadLocal;
+import org.elasticsearch.common.unit.TimeValue;
 import org.elasticsearch.common.util.concurrent.ConcurrentCollections;
 
 import java.io.IOException;
+import java.util.Iterator;
 import java.util.List;
-import java.util.Objects;
+import java.util.Map;
 import java.util.concurrent.ConcurrentMap;
+import java.util.function.LongSupplier;
 
 /** Utility class to resolve the Lucene doc ID, version, seqNo and primaryTerms for a given uid. */
 public final class VersionsAndSeqNoResolver {
 
-    static final ConcurrentMap<IndexReader.CacheKey, CloseableThreadLocal<PerThreadIDVersionAndSeqNoLookup[]>> lookupStates =
-        ConcurrentCollections.newConcurrentMapWithAggressiveConcurrency();
+    private static class PerThreadLookupCache {
+        private final Map<Thread, PerThreadIDVersionAndSeqNoLookup[]> perThreadPool = ConcurrentCollections.newConcurrentMap();
+        private volatile long lastUsedInMillis;
 
-    // Evict this reader from lookupStates once it's closed:
-    private static final IndexReader.ClosedListener removeLookupState = key -> {
-        CloseableThreadLocal<PerThreadIDVersionAndSeqNoLookup[]> ctl = lookupStates.remove(key);
-        if (ctl != null) {
-            ctl.close();
-        }
-    };
-
-    private static PerThreadIDVersionAndSeqNoLookup[] getLookupState(IndexReader reader, String uidField) throws IOException {
-        // We cache on the top level
-        // This means cache entries have a shorter lifetime, maybe as low as 1s with the
-        // default refresh interval and a steady indexing rate, but on the other hand it
-        // proved to be cheaper than having to perform a CHM and a TL get for every segment.
-        // See https://github.com/elastic/elasticsearch/pull/19856.
-        IndexReader.CacheHelper cacheHelper = reader.getReaderCacheHelper();
-        CloseableThreadLocal<PerThreadIDVersionAndSeqNoLookup[]> ctl = lookupStates.get(cacheHelper.getKey());
-        if (ctl == null) {
-            // First time we are seeing this reader's core; make a new CTL:
-            ctl = new CloseableThreadLocal<>();
-            CloseableThreadLocal<PerThreadIDVersionAndSeqNoLookup[]> other = lookupStates.putIfAbsent(cacheHelper.getKey(), ctl);
-            if (other == null) {
-                // Our CTL won, we must remove it when the reader is closed:
-                cacheHelper.addClosedListener(removeLookupState);
-            } else {
-                // Another thread beat us to it: just use their CTL:
-                ctl = other;
+        PerThreadIDVersionAndSeqNoLookup[] get(IndexReader reader, String uidField, long timeInMillis) throws IOException {
+            this.lastUsedInMillis = timeInMillis;
+            final PerThreadIDVersionAndSeqNoLookup[] reused = perThreadPool.get(Thread.currentThread());
+            if (reused != null) {
+                return reused;
             }
-        }
-
-        PerThreadIDVersionAndSeqNoLookup[] lookupState = ctl.get();
-        if (lookupState == null) {
-            lookupState = new PerThreadIDVersionAndSeqNoLookup[reader.leaves().size()];
+            final PerThreadIDVersionAndSeqNoLookup[] newState = new PerThreadIDVersionAndSeqNoLookup[reader.leaves().size()];
             for (LeafReaderContext leaf : reader.leaves()) {
-                lookupState[leaf.ord] = new PerThreadIDVersionAndSeqNoLookup(leaf.reader(), uidField);
+                newState[leaf.ord] = new PerThreadIDVersionAndSeqNoLookup(leaf.reader(), uidField);
             }
-            ctl.set(lookupState);
+            final PerThreadIDVersionAndSeqNoLookup[] existing = perThreadPool.put(Thread.currentThread(), newState);
+            assert existing == null;
+            return newState;
         }
-
-        if (lookupState.length != reader.leaves().size()) {
-            throw new AssertionError("Mismatched numbers of leaves: " + lookupState.length + " != " + reader.leaves().size());
-        }
-
-        if (lookupState.length > 0 && Objects.equals(lookupState[0].uidField, uidField) == false) {
-            throw new AssertionError("Index does not consistently use the same uid field: ["
-                    + uidField + "] != [" + lookupState[0].uidField + "]");
-        }
-
-        return lookupState;
     }
 
-    private VersionsAndSeqNoResolver() {
+    private final ConcurrentMap<IndexReader.CacheKey, PerThreadLookupCache> lookupCaches =
+        ConcurrentCollections.newConcurrentMapWithAggressiveConcurrency();
+    private final LongSupplier timeInMillisSupplier;
+
+    public VersionsAndSeqNoResolver(LongSupplier timeInMillisSupplier) {
+        this.timeInMillisSupplier = timeInMillisSupplier;
+    }
+
+    private PerThreadIDVersionAndSeqNoLookup[] getLookupState(IndexReader reader, String uidField) throws IOException {
+        final IndexReader.CacheHelper cacheHelper = reader.getReaderCacheHelper();
+        PerThreadLookupCache lookupPool = lookupCaches.get(cacheHelper.getKey());
+        if (lookupPool == null) {
+            lookupPool = new PerThreadLookupCache();
+            final PerThreadLookupCache existingPool = lookupCaches.putIfAbsent(cacheHelper.getKey(), lookupPool);
+            if (existingPool != null) {
+                lookupPool = existingPool;
+            } else {
+                cacheHelper.addClosedListener(lookupCaches::remove);
+            }
+        }
+        return lookupPool.get(reader, uidField, timeInMillisSupplier.getAsLong());
     }
 
     /** Wraps an {@link LeafReaderContext}, a doc ID <b>relative to the context doc base</b> and a version. */
@@ -129,8 +118,8 @@ public final class VersionsAndSeqNoResolver {
      * <li>a doc ID and a version otherwise
      * </ul>
      */
-    public static DocIdAndVersion loadDocIdAndVersion(IndexReader reader, Term term, boolean loadSeqNo) throws IOException {
-        PerThreadIDVersionAndSeqNoLookup[] lookups = getLookupState(reader, term.field());
+    public DocIdAndVersion loadDocIdAndVersion(IndexReader reader, Term term, boolean loadSeqNo) throws IOException {
+        final PerThreadIDVersionAndSeqNoLookup[] lookups = getLookupState(reader, term.field());
         List<LeafReaderContext> leaves = reader.leaves();
         // iterate backwards to optimize for the frequently updated documents
         // which are likely to be in the last segments
@@ -149,7 +138,7 @@ public final class VersionsAndSeqNoResolver {
      * Loads the internal docId and sequence number of the latest copy for a given uid from the provided reader.
      * The result is either null or the live and latest version of the given uid.
      */
-    public static DocIdAndSeqNo loadDocIdAndSeqNo(IndexReader reader, Term term) throws IOException {
+    public DocIdAndSeqNo loadDocIdAndSeqNo(IndexReader reader, Term term) throws IOException {
         final PerThreadIDVersionAndSeqNoLookup[] lookups = getLookupState(reader, term.field());
         final List<LeafReaderContext> leaves = reader.leaves();
         // iterate backwards to optimize for the frequently updated documents
@@ -163,5 +152,27 @@ public final class VersionsAndSeqNoResolver {
             }
         }
         return null;
+    }
+
+    public int cacheSize() {
+        return lookupCaches.size();
+    }
+
+    /**
+     * When an IndexReader is no longer used (because we refresh or close the shard), then its key will be removed
+     * from the lookupCaches. This cache is being invalidated during the indexing and eventually clean up when the
+     * indexing stops (we flush when shards become idle). However, if we cache some lookups after the indexing stops
+     * (see Engine#getFromSearcher), then we might keep these entries until we close the shard. To protect against
+     * this situation, we periodically prune inactive cache entries.
+     */
+    public void pruneInactiveCachedEntries(TimeValue maxInactiveInterval) {
+        final long maxTimeToPruneInMillis = timeInMillisSupplier.getAsLong() - maxInactiveInterval.millis();
+        final Iterator<Map.Entry<IndexReader.CacheKey, PerThreadLookupCache>> iterator = lookupCaches.entrySet().iterator();
+        while (iterator.hasNext()) {
+            final PerThreadLookupCache entry = iterator.next().getValue();
+            if (entry.lastUsedInMillis <= maxTimeToPruneInMillis) {
+                iterator.remove();
+            }
+        }
     }
 }

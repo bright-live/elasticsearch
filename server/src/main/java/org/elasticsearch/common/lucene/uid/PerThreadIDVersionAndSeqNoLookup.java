@@ -55,7 +55,6 @@ final class PerThreadIDVersionAndSeqNoLookup {
     // we keep it around for now, to reduce the amount of e.g. hash lookups by field and stuff
 
     /** terms enum for uid field */
-    final String uidField;
     private final TermsEnum termsEnum;
 
     /** Reused for iteration (when the term exists) */
@@ -68,7 +67,6 @@ final class PerThreadIDVersionAndSeqNoLookup {
      * Initialize lookup for the provided segment
      */
     PerThreadIDVersionAndSeqNoLookup(LeafReader reader, String uidField) throws IOException {
-        this.uidField = uidField;
         final Terms terms = reader.terms(uidField);
         if (terms == null) {
             // If a segment contains only no-ops, it does not have _uid but has both _soft_deletes and _tombstone fields.
@@ -87,9 +85,8 @@ final class PerThreadIDVersionAndSeqNoLookup {
         if (reader.getNumericDocValues(VersionFieldMapper.NAME) == null) {
             throw new IllegalArgumentException("reader misses the [" + VersionFieldMapper.NAME + "] field; _uid terms [" + terms + "]");
         }
-        Object readerKey = null;
-        assert (readerKey = reader.getCoreCacheHelper().getKey()) != null;
-        this.readerKey = readerKey;
+        assert reader.getCoreCacheHelper().getKey() != null;
+        this.readerKey = reader.getCoreCacheHelper().getKey();
     }
 
     /** Return null if id is not found.

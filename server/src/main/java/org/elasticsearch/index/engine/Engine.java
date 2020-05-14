@@ -121,6 +121,7 @@ public abstract class Engine implements Closeable {
     protected final ReleasableLock readLock = new ReleasableLock(rwl.readLock());
     protected final ReleasableLock writeLock = new ReleasableLock(rwl.writeLock());
     protected final SetOnce<Exception> failedEngine = new SetOnce<>();
+    final VersionsAndSeqNoResolver uidResolver;
     /*
      * on {@code lastWriteNanos} we use System.nanoTime() to initialize this since:
      *  - we use the value for figuring out if the shard / engine is active so if we startup and no write has happened yet we still
@@ -145,6 +146,7 @@ public abstract class Engine implements Closeable {
         this.logger = Loggers.getLogger(Engine.class,
                 engineConfig.getShardId());
         this.eventListener = engineConfig.getEventListener();
+        this.uidResolver = new VersionsAndSeqNoResolver(engineConfig.getThreadPool()::relativeTimeInMillis);
     }
 
     /** Returns 0 in the case where accountable is null, otherwise returns {@code ramBytesUsed()} */
@@ -550,11 +552,11 @@ public abstract class Engine implements Closeable {
     }
 
     protected final GetResult getFromSearcher(Get get, BiFunction<String, SearcherScope, Engine.Searcher> searcherFactory,
-                                                SearcherScope scope) throws EngineException {
+                                              SearcherScope scope) throws EngineException {
         final Engine.Searcher searcher = searcherFactory.apply("get", scope);
         final DocIdAndVersion docIdAndVersion;
         try {
-            docIdAndVersion = VersionsAndSeqNoResolver.loadDocIdAndVersion(searcher.getIndexReader(), get.uid(), true);
+            docIdAndVersion = uidResolver.loadDocIdAndVersion(searcher.getIndexReader(), get.uid(), true);
         } catch (Exception e) {
             Releasables.closeWhileHandlingException(searcher);
             //TODO: A better exception goes here
@@ -1745,6 +1747,13 @@ public abstract class Engine implements Closeable {
      * Tries to prune buffered deletes from the version map.
      */
     public abstract void maybePruneDeletes();
+
+    /**
+     * Prunes inactive cache entries of the the uid resolver that haven't been accessed for {@code maxInactiveInterval}.
+     */
+    public final void pruneInactiveUidLookupCaches(TimeValue maxInactiveInterval) {
+        uidResolver.pruneInactiveCachedEntries(maxInactiveInterval);
+    }
 
     /**
      * Returns the maximum auto_id_timestamp of all append-only index requests have been processed by this engine

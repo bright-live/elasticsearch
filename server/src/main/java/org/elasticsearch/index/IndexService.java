@@ -133,6 +133,7 @@ public class IndexService extends AbstractIndexComponent implements IndicesClust
     private volatile AsyncTranslogFSync fsyncTask;
     private volatile AsyncGlobalCheckpointTask globalCheckpointTask;
     private volatile AsyncRetentionLeaseSyncTask retentionLeaseSyncTask;
+    private final AsyncPruneUidLookupCacheTask pruneUidLookupCacheTask;
 
     // don't convert to Setting<> and register... we only set this in tests and register via a plugin
     private final String INDEX_TRANSLOG_RETENTION_CHECK_INTERVAL_SETTING = "index.translog.retention.check_interval";
@@ -233,6 +234,7 @@ public class IndexService extends AbstractIndexComponent implements IndicesClust
         this.trimTranslogTask = new AsyncTrimTranslogTask(this);
         this.globalCheckpointTask = new AsyncGlobalCheckpointTask(this);
         this.retentionLeaseSyncTask = new AsyncRetentionLeaseSyncTask(this);
+        this.pruneUidLookupCacheTask = new AsyncPruneUidLookupCacheTask(this);
         updateFsyncTaskIfNecessary();
     }
 
@@ -333,7 +335,8 @@ public class IndexService extends AbstractIndexComponent implements IndicesClust
                         fsyncTask,
                         trimTranslogTask,
                         globalCheckpointTask,
-                        retentionLeaseSyncTask);
+                        retentionLeaseSyncTask,
+                    pruneUidLookupCacheTask);
             }
         }
     }
@@ -1003,6 +1006,24 @@ public class IndexService extends AbstractIndexComponent implements IndicesClust
         @Override
         public String toString() {
             return "trim_translog";
+        }
+    }
+
+    static final class AsyncPruneUidLookupCacheTask extends BaseAsyncTask {
+        AsyncPruneUidLookupCacheTask(IndexService indexService) {
+            super(indexService, indexService.getIndexSettings()
+                .getSettings().getAsTime("index.engine.uid_lookup.prune_cache_interval", TimeValue.timeValueMinutes(10)));
+        }
+
+        @Override
+        protected void runInternal() {
+            for (IndexShard shard : indexService.shards.values()) {
+                try {
+                    shard.pruneInactiveUidLookupCaches(getInterval());
+                } catch (IndexShardClosedException | AlreadyClosedException ex) {
+                    // fine - continue;
+                }
+            }
         }
     }
 

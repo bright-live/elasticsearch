@@ -956,6 +956,9 @@ public abstract class EngineTestCase extends ESTestCase {
                         if ((docOffset + 1) % 4 == 0) {
                             engine.refresh("test");
                         }
+                        if ((docOffset + 1) % 4 == 0) {
+                            engine.pruneInactiveUidLookupCaches(TimeValue.timeValueMillis(between(0, 100)));
+                        }
                         if (rarely()) {
                             engine.flush();
                         }
@@ -976,6 +979,9 @@ public abstract class EngineTestCase extends ESTestCase {
             applyOperation(engine, operation);
             if (randomInt(100) < 10) {
                 engine.refresh("test");
+            }
+            if (randomInt(100) < 10) {
+                engine.pruneInactiveUidLookupCaches(TimeValue.timeValueMillis(between(0, 100)));
             }
             if (rarely()) {
                 engine.flush();
@@ -1239,5 +1245,9 @@ public abstract class EngineTestCase extends ESTestCase {
      */
     public static long getNumVersionLookups(Engine engine) {
         return ((InternalEngine) engine).getNumVersionLookups();
+    }
+
+    public static long getUidLookupCacheSize(Engine engine) {
+        return engine.uidResolver.cacheSize();
     }
 }

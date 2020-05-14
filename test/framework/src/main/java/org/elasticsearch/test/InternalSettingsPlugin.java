@@ -44,6 +44,10 @@ public final class InternalSettingsPlugin extends Plugin {
         Setting.timeSetting("index.translog.retention.check_interval", new TimeValue(10, TimeUnit.MINUTES),
             new TimeValue(-1, TimeUnit.MILLISECONDS), Property.Dynamic, Property.IndexScope);
 
+    public static final Setting<TimeValue> PRUNE_UI_LOOKUP_CACHE_INTERVAL_SETTING =
+        Setting.timeSetting("index.engine.uid_lookup.prune_cache_interval", new TimeValue(10, TimeUnit.MINUTES),
+            new TimeValue(-1, TimeUnit.MILLISECONDS), Property.Dynamic, Property.IndexScope);
+
     @Override
     public List<Setting<?>> getSettings() {
         return Arrays.asList(
@@ -51,6 +55,7 @@ public final class InternalSettingsPlugin extends Plugin {
                 INDEX_CREATION_DATE_SETTING,
                 PROVIDED_NAME_SETTING,
                 TRANSLOG_RETENTION_CHECK_INTERVAL_SETTING,
+                PRUNE_UI_LOOKUP_CACHE_INTERVAL_SETTING,
                 RemoteConnectionStrategy.REMOTE_MAX_PENDING_CONNECTION_LISTENERS,
                 IndexService.GLOBAL_CHECKPOINT_SYNC_INTERVAL_SETTING,
                 IndexService.RETENTION_LEASE_SYNC_INTERVAL_SETTING,

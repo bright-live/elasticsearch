@@ -3359,6 +3359,10 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
         };
     }
 
+    public void pruneInactiveUidLookupCaches(TimeValue maxInactiveInterval) {
+        getEngine().pruneInactiveUidLookupCaches(maxInactiveInterval);
+    }
+
     /**
      * Rollback the current engine to the safe commit, then replay local translog up to the global checkpoint.
      */
